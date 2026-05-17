@@ -1,24 +1,28 @@
 """
-obfuscator cho các file Python bị mã hóa theo cấu trúc:
-  exec(marshal.loads(lzma.decompress(base64.b85decode(blob[::-1]))))
-
-Cách dùng:
-  python deob.py <input_file.py> [output_file.py]
+Deobfuscator - giải mã toàn bộ các lớp mã hóa một lần:
+  Lớp 1: blob[::-1]  (đảo ngược)
+  Lớp 2: base64.b85decode
+  Lớp 3: lzma.decompress
+  Lớp 4: marshal.loads  -> code object
+  Lớp 5: các chuỗi bytes bên trong (zlib / base85 / hex lồng nhau)
 """
 
 import sys
-import re
 import base64
 import lzma
 import marshal
 import dis
+import zlib
 import io
+import binascii
 
-def decode_file(path: str) -> object:
+
+# ── Lớp 1-4: giải mã file gốc ────────────────────────────────────────────────
+
+def decode_outer(path: str):
     with open(path, "rb") as f:
         content = f.read()
 
-    # Tìm blob base85
     idx = content.index(b"b85decode(b'")
     start = idx + len(b"b85decode(b'")
     end = start
@@ -28,114 +32,205 @@ def decode_file(path: str) -> object:
         end += 1
 
     blob = content[start:end]
-    print(f"[*] Blob length: {len(blob):,} bytes", file=sys.stderr)
+    log(f"Blob: {len(blob):,} bytes")
 
-    # Reverse + base85 decode
     decoded = base64.b85decode(blob[::-1])
-    print(f"[*] After base85 decode: {len(decoded):,} bytes", file=sys.stderr)
+    log(f"Sau base85: {len(decoded):,} bytes")
 
-    # LZMA decompress
     decompressed = lzma.decompress(decoded)
-    print(f"[*] After LZMA decompress: {len(decompressed):,} bytes", file=sys.stderr)
+    log(f"Sau LZMA: {len(decompressed):,} bytes")
 
-    # Marshal load
     code_obj = marshal.loads(decompressed)
-    print(f"[*] Marshal loaded: {type(code_obj)}", file=sys.stderr)
+    log(f"Marshal OK: {code_obj.co_name}")
     return code_obj
 
 
-def try_decompile(code_obj) -> str | None:
-    """Thử dùng decompile3 hoặc uncompyle6 để ra mã nguồn."""
-    # decompile3 (hỗ trợ Python 3.x tốt hơn)
-    try:
-        import decompile  # type: ignore
-        out = io.StringIO()
-        decompile.decompile_code(code_obj, out)
-        return out.getvalue()
-    except Exception as e:
-        print(f"[!] decompile3 failed: {e}", file=sys.stderr)
+# ── Lớp 5: giải mã chuỗi bytes bên trong ────────────────────────────────────
 
-    # uncompyle6
+def try_decode_bytes(b: bytes) -> str | None:
+    """Thử nhiều cách giải mã một bytes constant."""
+    # zlib
     try:
-        import uncompyle6.main as u6  # type: ignore
-        out = io.StringIO()
-        u6.decompile_code(sys.version_info[:2], code_obj, out)
-        return out.getvalue()
-    except Exception as e:
-        print(f"[!] uncompyle6 failed: {e}", file=sys.stderr)
-
+        return zlib.decompress(b).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # zlib wbits=-15
+    try:
+        return zlib.decompress(b, -15).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # base85 -> zlib
+    try:
+        return zlib.decompress(base64.b85decode(b)).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # base85 -> lzma
+    try:
+        return lzma.decompress(base64.b85decode(b)).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # hex -> zlib
+    try:
+        return zlib.decompress(binascii.unhexlify(b)).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # base64 -> zlib
+    try:
+        return zlib.decompress(base64.b64decode(b)).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # thuần utf-8
+    try:
+        s = b.decode("utf-8")
+        if s.isprintable() and len(s) > 3:
+            return s
+    except Exception:
+        pass
     return None
 
 
-def disassemble_to_text(code_obj) -> str:
-    """Fallback: dùng dis để dump bytecode dạng đọc được."""
-    out = io.StringIO()
+# ── Thu thập toàn bộ thông tin từ code object ────────────────────────────────
 
-    def dump(co, depth=0):
-        indent = "  " * depth
-        out.write(f"\n{indent}{'='*60}\n")
-        out.write(f"{indent}FUNCTION: {co.co_name}  (file: {co.co_filename}, line: {co.co_firstlineno})\n")
-        out.write(f"{indent}args: {co.co_varnames[:co.co_argcount]}\n")
+def collect_all(co, out: io.StringIO, depth=0, seen=None):
+    if seen is None:
+        seen = set()
+    if id(co) in seen:
+        return
+    seen.add(id(co))
 
-        # In hằng số chuỗi có thể đọc được
-        readable_consts = []
-        for c in co.co_consts:
-            if isinstance(c, str) and len(c) > 1 and not all(ord(ch) > 3000 for ch in c[:5] if c):
-                readable_consts.append(repr(c))
-            elif isinstance(c, bytes):
-                try:
-                    s = c.decode("utf-8")
-                    if s.isprintable() and len(s) > 3:
-                        readable_consts.append(f"b{repr(s)}")
-                except Exception:
-                    pass
-        if readable_consts:
-            out.write(f"{indent}readable consts: {readable_consts}\n")
+    indent = "    " * depth
+    sep = "=" * (60 - depth * 4)
 
-        # Bytecode
-        old_stdout = sys.stdout
-        sys.stdout = out
-        try:
-            dis.dis(co)
-        finally:
-            sys.stdout = old_stdout
+    out.write(f"\n{indent}{sep}\n")
+    out.write(f"{indent}HÀM: {co.co_name}  "
+              f"(dòng {co.co_firstlineno}, file: {co.co_filename})\n")
+    if co.co_argcount:
+        out.write(f"{indent}Tham số: {co.co_varnames[:co.co_argcount]}\n")
 
-        # Đệ quy vào hàm con
-        for c in co.co_consts:
-            if hasattr(c, "co_name"):
-                dump(c, depth + 1)
+    # Hằng số
+    decoded_any = False
+    for i, c in enumerate(co.co_consts):
+        if isinstance(c, str) and len(c) > 1:
+            # Bỏ qua tên hàm Unicode thuần
+            if not all(ord(ch) > 3000 for ch in c[:8] if c):
+                out.write(f"{indent}  [chuỗi]: {repr(c)}\n")
+                decoded_any = True
+        elif isinstance(c, bytes) and len(c) > 3:
+            result = try_decode_bytes(c)
+            if result:
+                out.write(f"{indent}  [bytes giải mã #{i}]: {repr(result)}\n")
+                decoded_any = True
+            else:
+                out.write(f"{indent}  [bytes thô #{i}]: {c[:60]!r}{'...' if len(c)>60 else ''}\n")
+                decoded_any = True
 
-    dump(code_obj)
-    return out.getvalue()
+    # Tên biến / hàm được gọi (lọc bỏ Unicode rác)
+    readable_names = [n for n in co.co_names
+                      if n and not all(ord(ch) > 3000 for ch in n[:5])]
+    if readable_names:
+        out.write(f"{indent}  [names]: {readable_names}\n")
+
+    # Bytecode
+    out.write(f"\n{indent}  -- BYTECODE --\n")
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        dis.dis(co)
+    finally:
+        sys.stdout = old
+    for line in buf.getvalue().splitlines():
+        out.write(f"{indent}  {line}\n")
+
+    # Thử decompile nếu có
+    src = try_decompile(co)
+    if src:
+        out.write(f"\n{indent}  -- MÃ NGUỒN (decompile) --\n")
+        for line in src.splitlines():
+            out.write(f"{indent}  {line}\n")
+
+    # Đệ quy hàm con
+    for c in co.co_consts:
+        if hasattr(c, "co_name"):
+            collect_all(c, out, depth + 1, seen)
+
+
+def try_decompile(co) -> str | None:
+    try:
+        import decompile  # type: ignore
+        buf = io.StringIO()
+        decompile.decompile_code(co, buf)
+        return buf.getvalue()
+    except Exception:
+        pass
+    try:
+        import uncompyle6.main as u6  # type: ignore
+        buf = io.StringIO()
+        u6.decompile_code(sys.version_info[:2], co, buf)
+        return buf.getvalue()
+    except Exception:
+        pass
+    return None
+
+
+# ── Tóm tắt nhanh ────────────────────────────────────────────────────────────
+
+def quick_summary(co, out: io.StringIO, seen=None):
+    """In ngắn gọn tất cả chuỗi có thể đọc được (không bytecode)."""
+    if seen is None:
+        seen = set()
+    if id(co) in seen:
+        return
+    seen.add(id(co))
+
+    for c in co.co_consts:
+        if isinstance(c, str) and len(c) > 2:
+            if not all(ord(ch) > 3000 for ch in c[:8] if c):
+                out.write(f"[STR | {co.co_name}] {repr(c)}\n")
+        elif isinstance(c, bytes) and len(c) > 3:
+            result = try_decode_bytes(c)
+            if result and len(result) > 2:
+                out.write(f"[DECODED | {co.co_name}] {repr(result)}\n")
+        elif hasattr(c, "co_name"):
+            quick_summary(c, out, seen)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def log(msg: str):
+    print(f"[*] {msg}", file=sys.stderr)
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python deob.py <input.py> [output.py]")
+        print("Dùng: python deob.py <input.py> [output.py]")
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else "deobfuscated_output.py"
 
-    print(f"[*] Processing: {input_path}", file=sys.stderr)
-    code_obj = decode_file(input_path)
+    log(f"Đang xử lý: {input_path}")
+    code_obj = decode_outer(input_path)
 
-    print("[*] Trying decompiler...", file=sys.stderr)
-    source = try_decompile(code_obj)
+    out = io.StringIO()
 
-    if source:
-        print("[+] Decompiler succeeded! Writing source code.", file=sys.stderr)
-        result = source
-    else:
-        print("[~] Decompiler unavailable, falling back to bytecode disassembly.", file=sys.stderr)
-        result = "# *** BYTECODE DISASSEMBLY (decompiler not available for Python 3.13) ***\n"
-        result += "# Install: pip install decompile3\n\n"
-        result += disassemble_to_text(code_obj)
+    # Phần 1: Tóm tắt nhanh - dễ đọc
+    out.write("=" * 70 + "\n")
+    out.write("TÓM TẮT NHANH - TẤT CẢ CHUỖI CÓ THỂ ĐỌC ĐƯỢC\n")
+    out.write("=" * 70 + "\n\n")
+    quick_summary(code_obj, out)
 
+    # Phần 2: Chi tiết đầy đủ với bytecode
+    out.write("\n\n" + "=" * 70 + "\n")
+    out.write("CHI TIẾT ĐẦY ĐỦ - BYTECODE + GIẢI MÃ TỪNG HÀM\n")
+    out.write("=" * 70 + "\n")
+    collect_all(code_obj, out)
+
+    result = out.getvalue()
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)
 
-    print(f"[+] Done! Output written to: {output_path}", file=sys.stderr)
+    log(f"Xong! Kết quả: {output_path}")
 
 
 if __name__ == "__main__":
