@@ -1,5 +1,5 @@
 """
-Deobfuscator cho các file Python bị mã hóa theo cấu trúc:
+obfuscator cho các file Python bị mã hóa theo cấu trúc:
   exec(marshal.loads(lzma.decompress(base64.b85decode(blob[::-1]))))
 
 Cách dùng:
