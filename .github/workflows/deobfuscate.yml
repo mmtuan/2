@@ -1,0 +1,36 @@
+name: Deobfuscate Python Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_file:
+        description: 'Tên file cần giải mã (để trong thư mục files/)'
+        required: true
+        default: 'target.py'
+
+jobs:
+  deobfuscate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install decompiler
+        run: pip install decompile3 || echo "No decompiler"
+
+      - name: Run deobfuscator
+        run: python deob.py "files/${{ github.event.inputs.target_file }}" output.py
+
+      - name: Show result
+        run: cat output.py
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: deobfuscated-source
+          path: output.py
