@@ -8,9 +8,8 @@ import io
 import binascii
 import builtins
 import types
+import re
 
-
-# ── Logging ───────────────────────────────────────────────────────────────────
 
 def log(msg: str):
     print(f"[*] {msg}", file=sys.stderr)
@@ -21,7 +20,6 @@ def log(msg: str):
 def decode_outer(path: str) -> types.CodeType:
     with open(path, "rb") as f:
         content = f.read()
-
     idx = content.index(b"b85decode(b'")
     start = idx + len(b"b85decode(b'")
     end = start
@@ -29,7 +27,6 @@ def decode_outer(path: str) -> types.CodeType:
         if content[end:end+1] == b"'":
             break
         end += 1
-
     blob = content[start:end]
     log(f"Blob: {len(blob):,} bytes")
     decoded = base64.b85decode(blob[::-1])
@@ -41,7 +38,7 @@ def decode_outer(path: str) -> types.CodeType:
     return code_obj
 
 
-# ── Thử giải mã bytes constant bằng nhiều cách ───────────────────────────────
+# ── Thử giải mã bytes constant ───────────────────────────────────────────────
 
 def try_decode_bytes(b: bytes) -> str | None:
     attempts = [
@@ -51,7 +48,6 @@ def try_decode_bytes(b: bytes) -> str | None:
         lambda: zlib.decompress(base64.b85decode(b)).decode("utf-8", errors="replace"),
         lambda: lzma.decompress(base64.b85decode(b)).decode("utf-8", errors="replace"),
         lambda: zlib.decompress(base64.b64decode(b)).decode("utf-8", errors="replace"),
-        lambda: zlib.decompress(binascii.unhexlify(b)).decode("utf-8", errors="replace"),
         lambda: b.decode("utf-8") if b.decode("utf-8").isprintable() else None,
     ]
     for fn in attempts:
@@ -64,60 +60,124 @@ def try_decode_bytes(b: bytes) -> str | None:
     return None
 
 
-# ── Patch exec/eval để bắt code bên trong ────────────────────────────────────
+# ── Sandbox thông minh ────────────────────────────────────────────────────────
 
-_captured_codes: list[tuple[str, object]] = []
-_original_exec = builtins.exec
-_original_eval = builtins.eval
-_original_compile = builtins.compile
+_captured: list[tuple[str, object]] = []
+_orig_exec    = builtins.exec
+_orig_eval    = builtins.eval
+_orig_compile = builtins.compile
+_orig_import  = builtins.__import__
+_orig_print   = builtins.print
+_orig_open    = builtins.open
+
+# Ngưỡng: nếu code/string dài hơn thế này → coi là payload thật
+PAYLOAD_MIN_LEN = 500
 
 
-def _safe_exec(obj, globs=None, locs=None):
+def _is_payload(obj) -> bool:
+    """Kiểm tra obj có phải là payload thật cần chặn không."""
     if isinstance(obj, types.CodeType):
-        _captured_codes.append(("exec:code", obj))
-    elif isinstance(obj, str) and len(obj) > 10:
-        _captured_codes.append(("exec:str", obj))
-    # Không thực thi thật sự
+        # Code object có nhiều constant/name → là payload
+        if len(obj.co_consts) > 10 or len(obj.co_names) > 5:
+            return True
+        # Code object có nested code objects → là payload
+        if any(hasattr(c, "co_name") for c in obj.co_consts):
+            return True
+    if isinstance(obj, str) and len(obj) > PAYLOAD_MIN_LEN:
+        return True
+    return False
 
 
-def _safe_eval(obj, globs=None, locs=None):
-    if isinstance(obj, types.CodeType):
-        _captured_codes.append(("eval:code", obj))
-    elif isinstance(obj, str) and len(obj) > 10:
-        _captured_codes.append(("eval:str", obj))
-    return None
+def _smart_exec(obj, globs=None, locs=None):
+    if _is_payload(obj):
+        log(f"  ✅ Bắt được exec payload: {type(obj).__name__}, size={len(obj.co_consts) if isinstance(obj, types.CodeType) else len(obj)}")
+        _captured.append(("exec", obj))
+        return None  # Không thực thi
+    # Cho chạy thật nếu nhỏ/đơn giản
+    try:
+        return _orig_exec(obj, globs or {}, locs)
+    except Exception:
+        pass
 
 
-def _safe_compile(source, filename, mode, *args, **kwargs):
-    result = _original_compile(source, filename, mode, *args, **kwargs)
-    if isinstance(source, str) and len(source) > 10:
-        _captured_codes.append(("compile:str", source))
+def _smart_eval(obj, globs=None, locs=None):
+    if _is_payload(obj):
+        log(f"  ✅ Bắt được eval payload: {type(obj).__name__}")
+        _captured.append(("eval", obj))
+        return None
+    # Cho chạy thật
+    try:
+        return _orig_eval(obj, globs or {}, locs)
+    except Exception:
+        return None
+
+
+def _smart_compile(source, filename, mode, *args, **kwargs):
+    result = _orig_compile(source, filename, mode, *args, **kwargs)
+    if isinstance(source, str) and len(source) > PAYLOAD_MIN_LEN:
+        log(f"  ✅ Bắt được compile: {len(source)} ký tự")
+        _captured.append(("compile:str", source))
     return result
 
 
-def run_in_sandbox(code_obj: types.CodeType) -> list[tuple[str, object]]:
-    """Chạy code_obj trong sandbox với exec/eval bị patch."""
-    log("Đang chạy trong sandbox (exec/eval bị chặn)...")
-    builtins.exec = _safe_exec
-    builtins.eval = _safe_eval
-    builtins.compile = _safe_compile
+def _smart_import(name, *args, **kwargs):
+    log(f"  📦 import: {name}")
+    # Chặn những module nguy hiểm
+    blocked = {"subprocess", "socket", "os", "shutil", "ctypes"}
+    if name in blocked:
+        log(f"  🚫 Blocked import: {name}")
+        raise ImportError(f"Blocked: {name}")
+    return _orig_import(name, *args, **kwargs)
+
+
+_print_log: list[str] = []
+def _smart_print(*args, **kwargs):
+    line = " ".join(str(a) for a in args)
+    _print_log.append(line)
+    log(f"  📢 print: {line[:200]}")
+
+
+def run_sandbox(code_obj: types.CodeType) -> list[tuple[str, object]]:
+    log("Đang chạy sandbox thông minh (chỉ chặn payload lớn)...")
+    builtins.exec    = _smart_exec
+    builtins.eval    = _smart_eval
+    builtins.compile = _smart_compile
+    builtins.__import__ = _smart_import
+    builtins.print   = _smart_print
     try:
         fake_globals = {
             "__name__": "__main__",
             "__builtins__": builtins,
         }
-        _original_exec(code_obj, fake_globals)
+        _orig_exec(code_obj, fake_globals)
+    except ZeroDivisionError:
+        log("  ⚠️  ZeroDivisionError (bình thường - trick chống debug)")
+    except SystemExit:
+        log("  ⚠️  SystemExit")
     except Exception as e:
-        log(f"Sandbox exception (bình thường): {type(e).__name__}: {e}")
+        log(f"  ⚠️  Exception: {type(e).__name__}: {e}")
     finally:
-        builtins.exec = _original_exec
-        builtins.eval = _original_eval
-        builtins.compile = _original_compile
-    log(f"Bắt được {len(_captured_codes)} code object / chuỗi bên trong")
-    return list(_captured_codes)
+        builtins.exec    = _orig_exec
+        builtins.eval    = _orig_eval
+        builtins.compile = _orig_compile
+        builtins.__import__ = _orig_import
+        builtins.print   = _orig_print
+    log(f"Kết quả sandbox: {len(_captured)} payload bắt được")
+    return list(_captured)
 
 
-# ── Decompiler ────────────────────────────────────────────────────────────────
+# ── Disassemble & decompile ───────────────────────────────────────────────────
+
+def disassemble(co: types.CodeType) -> str:
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        dis.dis(co)
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
 
 def try_decompile(co: types.CodeType) -> str | None:
     for pkg in ("decompile", "uncompyle6.main"):
@@ -137,20 +197,7 @@ def try_decompile(co: types.CodeType) -> str | None:
     return None
 
 
-# ── Disassemble dạng dễ đọc ───────────────────────────────────────────────────
-
-def disassemble(co: types.CodeType) -> str:
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        dis.dis(co)
-    finally:
-        sys.stdout = old
-    return buf.getvalue()
-
-
-# ── Thu thập chuỗi ───────────────────────────────────────────────────────────
+# ── Chuỗi có thể đọc được ────────────────────────────────────────────────────
 
 def collect_strings(co: types.CodeType, results: list, seen: set | None = None):
     if seen is None:
@@ -163,9 +210,9 @@ def collect_strings(co: types.CodeType, results: list, seen: set | None = None):
             if not all(ord(ch) > 3000 for ch in c[:8] if c):
                 results.append(("STR", co.co_name, c))
         elif isinstance(c, bytes) and len(c) > 3:
-            decoded = try_decode_bytes(c)
-            if decoded:
-                results.append(("BYTES", co.co_name, decoded))
+            dec = try_decode_bytes(c)
+            if dec:
+                results.append(("BYTES", co.co_name, dec))
         elif hasattr(c, "co_name"):
             collect_strings(c, results, seen)
 
@@ -175,59 +222,67 @@ def collect_strings(co: types.CodeType, results: list, seen: set | None = None):
 def write_output(path: str, outer_co: types.CodeType, captured: list):
     with open(path, "w", encoding="utf-8") as f:
 
-        # ── PHẦN 1: Chuỗi đọc được từ lớp ngoài ──
+        # PHẦN 1: chuỗi lớp ngoài
         f.write("=" * 70 + "\n")
         f.write("PHẦN 1: CHUỖI GIẢI MÃ TỪ LỚP NGOÀI\n")
         f.write("=" * 70 + "\n\n")
-        strings: list = []
-        collect_strings(outer_co, strings)
-        if strings:
-            for kind, fn, val in strings:
-                f.write(f"[{kind} | hàm: {fn}]\n  {repr(val)}\n\n")
-        else:
-            f.write("(không có chuỗi đọc được)\n")
+        strs: list = []
+        collect_strings(outer_co, strs)
+        for kind, fn, val in strs:
+            f.write(f"[{kind} | {fn}]  {repr(val)}\n")
 
-        # ── PHẦN 2: Code bắt được qua sandbox ──
+        # PHẦN 2: print output bắt được
+        if _print_log:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write("PHẦN 2: OUTPUT (print) BẮT ĐƯỢC KHI CHẠY\n")
+            f.write("=" * 70 + "\n\n")
+            for line in _print_log:
+                f.write(line + "\n")
+
+        # PHẦN 3: payload bắt được
         f.write("\n" + "=" * 70 + "\n")
-        f.write("PHẦN 2: CODE BẮT ĐƯỢC KHI CHẠY SANDBOX\n")
+        f.write("PHẦN 3: PAYLOAD BẮT ĐƯỢC\n")
         f.write("=" * 70 + "\n\n")
 
         if not captured:
-            f.write("(không bắt được gì — code có thể kiểm tra môi trường trước khi exec)\n")
+            f.write("⚠️  Không bắt được payload.\n")
+            f.write("    Code có thể dùng thêm lớp anti-sandbox khác.\n")
+            f.write("    Xem Phần 4 để đọc bytecode thủ công.\n")
         else:
             for i, (kind, obj) in enumerate(captured):
-                f.write(f"\n--- [{i+1}] Loại: {kind} ---\n")
+                f.write(f"\n--- [{i+1}] {kind} ---\n")
                 if isinstance(obj, str):
-                    f.write(obj + "\n")
+                    # Thử giải mã nếu trông như encoded
+                    decoded = None
+                    if len(obj) > 100 and not ' ' in obj[:50]:
+                        try:
+                            decoded = base64.b64decode(obj).decode("utf-8", errors="replace")
+                        except Exception:
+                            pass
+                    f.write(decoded if decoded else obj)
+                    f.write("\n")
                 elif isinstance(obj, types.CodeType):
-                    # Thử decompile trước
                     src = try_decompile(obj)
                     if src:
                         f.write("# ✅ Decompile thành công:\n")
                         f.write(src + "\n")
                     else:
-                        f.write("# ℹ️  Bytecode disassembly (decompile3 chưa hỗ trợ Python 3.13):\n")
+                        f.write("# Bytecode:\n")
                         f.write(disassemble(obj) + "\n")
-
-                    # Chuỗi trong code này
                     inner: list = []
                     collect_strings(obj, inner)
                     if inner:
-                        f.write("\n# Chuỗi trong code object này:\n")
-                        for kind2, fn2, val2 in inner:
-                            f.write(f"#   [{kind2}] {repr(val2)}\n")
+                        f.write("\n# Chuỗi trong payload:\n")
+                        for k, fn, v in inner:
+                            f.write(f"#   {repr(v)}\n")
 
-        # ── PHẦN 3: Bytecode lớp ngoài ──
+        # PHẦN 4: bytecode lớp ngoài
         f.write("\n" + "=" * 70 + "\n")
-        f.write("PHẦN 3: BYTECODE LỚP NGOÀI (tham khảo)\n")
+        f.write("PHẦN 4: BYTECODE LỚP NGOÀI\n")
         f.write("=" * 70 + "\n\n")
         src = try_decompile(outer_co)
-        if src:
-            f.write("# ✅ Decompile thành công:\n")
-            f.write(src + "\n")
-        else:
-            f.write("# ℹ️  Bytecode:\n")
-            f.write(disassemble(outer_co) + "\n")
+        f.write(src if src else disassemble(outer_co))
+        f.write("\n")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -236,15 +291,13 @@ def main():
     if len(sys.argv) < 2:
         print("Dùng: python deob.py <input.py> [output.py]")
         sys.exit(1)
-
     input_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else "deobfuscated_output.txt"
-
+    output_path = sys.argv[2] if len(sys.argv) > 2 else "output.txt"
     log(f"Đang xử lý: {input_path}")
     outer_co = decode_outer(input_path)
-    captured = run_in_sandbox(outer_co)
+    captured = run_sandbox(outer_co)
     write_output(output_path, outer_co, captured)
-    log(f"Xong! Kết quả: {output_path}")
+    log(f"Xong! → {output_path}")
 
 
 if __name__ == "__main__":
