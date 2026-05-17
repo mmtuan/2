@@ -2,11 +2,6 @@ name: Deobfuscate Python Files
 
 on:
   workflow_dispatch:
-    inputs:
-      target_file:
-        description: 'Tên file cần giải mã (để trong thư mục files/)'
-        required: true
-        default: 'target.py'
 
 jobs:
   deobfuscate:
@@ -15,22 +10,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: List files in repo
+        run: |
+          echo "=== Các file trong thư mục files/ ==="
+          ls -la files/ 2>/dev/null || echo "⚠️  Thư mục files/ không tồn tại hoặc chưa có file nào!"
+
       - name: Setup Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
       - name: Install decompiler
-        run: pip install decompile3 || echo "No decompiler"
+        run: pip install decompile3 || echo "decompile3 không cài được, sẽ dùng bytecode dis"
 
-      - name: Run deobfuscator
-        run: python deob.py "files/${{ github.event.inputs.target_file }}" output.py
+      - name: Run deobfuscator on ALL files in files/
+        run: |
+          mkdir -p results
+          for f in files/*.py; do
+            if [ -f "$f" ]; then
+              name=$(basename "$f" .py)
+              echo "=========================================="
+              echo "🔓 Đang giải mã: $f"
+              echo "=========================================="
+              python deob.py "$f" "results/${name}_deob.py" && echo "✅ Xong: results/${name}_deob.py" || echo "❌ Lỗi với file: $f"
+            fi
+          done
 
-      - name: Show result
-        run: cat output.py
+      - name: Show all results
+        run: |
+          for f in results/*_deob.py; do
+            echo ""
+            echo "====== $f ======"
+            cat "$f"
+          done
 
-      - name: Upload result
+      - name: Upload all results
         uses: actions/upload-artifact@v4
         with:
-          name: deobfuscated-source
-          path: output.py
+          name: deobfuscated-all
+          path: results/
