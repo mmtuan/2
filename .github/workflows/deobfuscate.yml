@@ -10,42 +10,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: List files in repo
+      - name: Kiểm tra thư mục files/
         run: |
-          echo "=== Các file trong thư mục files/ ==="
-          ls -la files/ 2>/dev/null || echo "⚠️  Thư mục files/ không tồn tại hoặc chưa có file nào!"
+          echo "=== Các file trong files/ ==="
+          ls -la files/ 2>/dev/null || { echo "⚠️  Không tìm thấy thư mục files/"; exit 1; }
 
       - name: Setup Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: Install decompiler
-        run: pip install decompile3 || echo "decompile3 không cài được, sẽ dùng bytecode dis"
+      - name: Cài build tools cho pycdc
+        run: sudo apt-get install -y cmake build-essential
 
-      - name: Run deobfuscator on ALL files in files/
+      - name: Build pycdc từ source
+        run: |
+          git clone https://github.com/zrax/pycdc.git
+          cd pycdc
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          echo "✅ pycdc build xong"
+
+      - name: Xuất marshal bytes từ file obfuscated
         run: |
           mkdir -p results
-          for f in files/*.py; do
-            if [ -f "$f" ]; then
-              name=$(basename "$f" .py)
-              echo "=========================================="
-              echo "🔓 Đang giải mã: $f"
-              echo "=========================================="
-              python deob.py "$f" "results/${name}_deob.py" && echo "✅ Xong: results/${name}_deob.py" || echo "❌ Lỗi với file: $f"
-            fi
-          done
+          python extract_marshal.py files/
 
-      - name: Show all results
+      - name: Chạy pycdc để decompile
         run: |
-          for f in results/*_deob.py; do
-            echo ""
-            echo "====== $f ======"
-            cat "$f"
+          for pyc in results/*.pyc; do
+            [ -f "$pyc" ] || continue
+            name=$(basename "$pyc" .pyc)
+            echo "🔓 Decompile: $pyc"
+            ./pycdc/build/pycdc "$pyc" > "results/${name}_source.py" 2>&1 && echo "✅ pycdc OK" || echo "⚠️  pycdc thất bại"
+            ./pycdc/build/pycdas "$pyc" > "results/${name}_asm.txt" 2>&1 && echo "✅ pycdas OK" || true
           done
 
-      - name: Upload all results
+      - name: Chạy deob.py
+        run: |
+          for f in files/*.py; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .py)
+            echo "🔓 Đang xử lý: $f"
+            python deob.py "$f" "results/${name}_strings.txt" && echo "✅ Xong" || echo "❌ Lỗi"
+          done
+
+      - name: Upload tất cả kết quả
         uses: actions/upload-artifact@v4
         with:
-          name: deobfuscated-all
+          name: ket-qua-giai-ma
           path: results/
